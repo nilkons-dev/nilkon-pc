@@ -1,0 +1,6 @@
+dist/
+build/
+vlc_bundle/
+installer_output/
+__pycache__/
+*.spec
