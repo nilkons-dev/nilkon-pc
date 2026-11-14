@@ -275,7 +275,13 @@ class OnlinePage(QWidget):
         tv.addWidget(title)
         tv.addWidget(self.subtitle)
         head.addLayout(tv, 1)
+        self.refresh_btn = GButton("Refresh", "reset", "glass", 16)
+        self.refresh_btn.setToolTip("Show different songs")
+        self.refresh_btn.clicked.connect(host.refresh_suggestions_online)
+        self.refresh_btn.hide()
+        head.addWidget(self.refresh_btn, 0, Qt.AlignmentFlag.AlignBottom)
         lay.addLayout(head)
+        self.discover = False
 
         self.list = ResultList(self)
         self.list.playRequested.connect(self.playRequested)
@@ -311,8 +317,27 @@ class OnlinePage(QWidget):
         self.show_message("idle")
 
     # -- state -----------------------------------------------------------------------------------
+    SUBTITLE = "Search any song · stream instantly · download to listen offline"
+
     def set_busy(self, busy):
-        self.subtitle.setText("Searching…" if busy else "Search any song · stream instantly · download to listen offline")
+        if busy:
+            self.subtitle.setText("Searching…")
+        else:
+            self.subtitle.setText(self._discover_text if self.discover else self.SUBTITLE)
+
+    _discover_text = "Made for you"
+
+    def set_discover(self, on, label=""):
+        """True: the list shows personal suggestions (a Refresh button appears). False: normal search results."""
+        self.discover = bool(on)
+        if on:
+            self._discover_text = (label or "Made for you") + " · learns from what you search, play and like"
+        self.refresh_btn.setVisible(self.discover)
+        self.subtitle.setText(self._discover_text if self.discover else self.SUBTITLE)
+
+    def set_discover_busy(self, busy):
+        if self.discover or busy:
+            self.subtitle.setText("Finding songs for you…" if busy else self._discover_text)
 
     def thumb(self, item):
         return self.host.remote_images.get(item["thumb_url"], 120)

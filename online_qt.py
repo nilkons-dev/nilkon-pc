@@ -32,6 +32,8 @@ class OnlineJobs(QObject):
     cacheFailed = Signal(str)
     networkChecked = Signal(bool)
     prefetched = Signal(str, str)             # key, stream address (resolved in advance)
+    suggestDone = Signal(int, object, str)    # token, items, label
+    suggestFailed = Signal(int, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -103,6 +105,22 @@ class OnlineJobs(QObject):
             self._emit("searchFailed", token, online.friendly_error(exc))
             return
         self._emit("searchDone", token, list(items))
+
+    def suggest(self, taste, n=24):
+        """Builds the personal 'Made for you' list on a worker thread."""
+        with self._lock:
+            self._sug_token = getattr(self, "_sug_token", 0) + 1
+            token = self._sug_token
+        self._submit(self._suggest, token, taste, n)
+        return token
+
+    def _suggest(self, token, taste, n):
+        try:
+            items, label = taste.build(n, online.search, online.related)
+        except Exception as exc:
+            self._emit("suggestFailed", token, online.friendly_error(exc))
+            return
+        self._emit("suggestDone", token, list(items), label)
 
     def related(self, item):
         self._submit(self._related, item)

@@ -59,6 +59,7 @@ from icons import qicon
 from library import Library, ALL, LIKED, RECENT, is_online, effective_preamp
 import crashlog
 import online
+from taste import Taste
 from online import cleanup_partial, find_ffmpeg
 from online_page import OnlinePage
 from thread_bridge import Mailbox
@@ -68,6 +69,7 @@ from presence import DiscordPresence
 from cat_widgets import CatButton
 from panels import LogoMark, WordMark, QueueList, PlaylistDelegate, ASSETS
 from settings_dialog import SettingsDialog
+from titlebar import TitleBar, edges_at, cursor_for
 from theme import T, ink, hue_for, nice_time, build_qss, FONT_FAMILIES
 from tracklist import TrackList, ColumnHeader
 from visuals import Turntable, MiniDisc, Spectrum, WaveField
@@ -115,6 +117,7 @@ class MusicPlayer(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)      # NILKON draws its own title bar
         self.resize(1480, 920)
         self.setMinimumSize(1240, 780)
         self.setAcceptDrops(True)
@@ -194,7 +197,16 @@ class MusicPlayer(QMainWindow):
         self.analyzer.ready.connect(self._on_analysis_ready)
         self.analyzer.failed.connect(self._on_analysis_failed)
 
+        self.taste = Taste(self.lib.dir)
+        self._suggest_items = []
+        self._suggest_label = "Made for you"
+        self._suggest_token = None
+        self._suggest_t = 0.0
+        self._taste_item = None
+        self._search_explicit = False
         self.jobs = OnlineJobs(self)
+        self.jobs.suggestDone.connect(self._on_suggest_done)
+        self.jobs.suggestFailed.connect(self._on_suggest_failed)
         self.jobs.searchDone.connect(self._on_search_done)
         self.jobs.searchFailed.connect(self._on_search_failed)
         self.jobs.relatedDone.connect(self._on_related_done)
@@ -302,12 +314,63 @@ class MusicPlayer(QMainWindow):
             self.setWindowTitle(f"{text} — {APP_NAME}")
         else:
             self.setWindowTitle(APP_NAME)
+        if hasattr(self, "titlebar"):
+            self.titlebar.set_title(text if self.lib.settings.get("title_song", True) else "")
+
+    # -- frameless window: maximise, resize from the edges, rounded corners ---------------------------
+    @staticmethod
+    def _margins(maximized):
+        return (8, 6, 8, 8) if maximized else (16, 10, 16, 16)
+
+    def toggle_maximize(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def eventFilter(self, obj, ev):
+        if obj is getattr(self, "backdrop", None) and not (self.isMaximized() or self.isFullScreen()):
+            t = ev.type()
+            if t == QEvent.Type.MouseMove or t == QEvent.Type.MouseButtonPress:
+                pos = ev.position().toPoint()
+                edges = edges_at(pos, obj.width(), obj.height())
+                if edges:
+                    if t == QEvent.Type.MouseMove:
+                        obj.setCursor(cursor_for(edges))
+                    elif ev.button() == Qt.MouseButton.LeftButton and self.windowHandle() is not None:
+                        self.windowHandle().startSystemResize(edges)
+                        return True
+                elif t == QEvent.Type.MouseMove:
+                    obj.unsetCursor()
+            elif t == QEvent.Type.Leave:
+                obj.unsetCursor()
+        return super().eventFilter(obj, ev)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if sys.platform == "win32" and not getattr(self, "_frame_done", False):
+            self._frame_done = True
+            QTimer.singleShot(0, self._polish_frame)
+
+    def _polish_frame(self):
+        """Windows 11: round the corners of the frameless window and give it a thin accent-tinted border."""
+        try:
+            import ctypes
+            from ctypes import byref, c_int, windll
+            hwnd = int(self.winId())
+            windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, byref(c_int(2)), 4)          # DWMWCP_ROUND
+            c = T.c1
+            colorref = (int(c.blue() * 0.35) << 16) | (int(c.green() * 0.35) << 8) | int(c.red() * 0.35)
+            windll.dwmapi.DwmSetWindowAttribute(hwnd, 34, byref(c_int(colorref)), 4)    # border colour
+        except Exception:
+            pass
 
     def save_soon(self):
         self.save_timer.start(1200)
 
     def _flush(self):
         self.lib.save()
+        self.taste.save()
 
     def _space(self):
         w = QApplication.focusWidget()
@@ -323,8 +386,14 @@ class MusicPlayer(QMainWindow):
         self.backdrop = central
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(14)
+        self._outer = outer
+        outer.setContentsMargins(*self._margins(False))
+        outer.setSpacing(12)
+        self.titlebar = TitleBar(self, self.windowIcon())
+        self.titlebar.toggleMaximize.connect(self.toggle_maximize)
+        outer.addWidget(self.titlebar)
+        central.setMouseTracking(True)
+        central.installEventFilter(self)
         row = QHBoxLayout()
         row.setSpacing(14)
         row.addWidget(self._build_sidebar())
@@ -700,6 +769,61 @@ class MusicPlayer(QMainWindow):
         self.pages.setCurrentIndex(2)
         self.search.setFocus()
         self._update_nav()
+        if not self.search.text().strip() and not (self.online_results and not self.online.discover):
+            self._show_discover()
+
+    # -- online: personal suggestions ("Made for you") ---------------------------------------------
+    def _show_discover(self, force=False):
+        """The Online page without a search: songs picked from what the user searches, plays and likes."""
+        fresh = self._suggest_items and _time.monotonic() - self._suggest_t < 600
+        if fresh and not force:
+            self.online_results = list(self._suggest_items)
+            self.online.set_discover(True, self._suggest_label)
+            self.online.set_results(self._suggest_items)
+            return
+        self.request_suggestions()
+
+    def refresh_suggestions_online(self):
+        self._show_discover(force=True)
+
+    def request_suggestions(self):
+        self.online.set_discover(True, self._suggest_label)
+        self.online.set_discover_busy(True)
+        if not self._suggest_items or self.online.stack.currentIndex() == 1:
+            self.online.show_message("loading")
+        self._suggest_token = self.jobs.suggest(self.taste)
+
+    def _on_suggest_done(self, token, items, label):
+        if token != self._suggest_token:
+            return
+        self._suggest_items = list(items)
+        self._suggest_label = label
+        self._suggest_t = _time.monotonic()
+        for it in items:
+            self.online_items.setdefault(it["key"], it)
+            self.lib.see_online(it)
+        for it in items[:5]:                           # look up the first songs now: Play starts at once
+            self.jobs.prefetch(it)
+        if self.page == "online" and not self.search.text().strip():
+            self.online_results = list(items)
+            self.online.set_discover(True, label)
+            if items:
+                self.online.set_results(items)
+            else:
+                self.online.show_message("empty")
+        else:
+            self.online.set_discover_busy(False)
+
+    def _on_suggest_failed(self, token, msg):
+        if token != self._suggest_token:
+            return
+        self.online.set_discover_busy(False)
+        if self.page == "online" and not self.search.text().strip():
+            if self._suggest_items:
+                self.toast_msg(msg, 3200)
+            else:
+                self.online.set_discover(False)
+                self.online.show_message("error", msg)
 
     def show_collection(self, name):
         self.page = "collection"
@@ -725,6 +849,7 @@ class MusicPlayer(QMainWindow):
             self.search_timer.stop()
             q = self.search.text().strip()
             if q:
+                self._search_explicit = True
                 self.run_online_search(q)
 
     def _live_search(self):
@@ -738,7 +863,7 @@ class MusicPlayer(QMainWindow):
             self._search_token = None
             self.online_results = []
             self.online.set_busy(False)
-            self.online.show_message("idle")
+            self._show_discover()
 
     def _playlist_clicked(self, item):
         name = item.data(Qt.ItemDataRole.UserRole)
@@ -1051,8 +1176,12 @@ class MusicPlayer(QMainWindow):
             self._set_queue(self.lib.tracks, ALL)
         self._req_t = _time.monotonic() if autoplay else 0.0
         self._pending_seek = start_ms if start_ms > 0 else None
+        self._taste_finish()
         self._listen_acc = 0.0
         self._listen_done = False
+        self._taste_item = self._taste_item_for(path)
+        if self._taste_item is not None:
+            self.taste.on_play(self._taste_item)
         self.player.set_media(self.instance.media_new_path(path))
         if autoplay:
             self.player.play()
@@ -1562,12 +1691,37 @@ class MusicPlayer(QMainWindow):
         self.like_btn.set_icon("heart-fill" if liked else "heart")
         self.like_btn.set_active(liked)
 
+    def _taste_finish(self):
+        """The song that was playing is being left: tell the taste profile how long it was really listened to."""
+        item, self._taste_item = self._taste_item, None
+        if item is not None:
+            try:
+                self.taste.on_listen(item, self._listen_acc, int(item.get("duration_ms") or 0))
+            except Exception:
+                pass
+
+    def _taste_item_for(self, path):
+        if is_online(path):
+            it = self.online_items.get(path)
+            return dict(it) if it else None
+        meta = self.lib.meta.get(path, {})
+        artist = meta.get("artist", "") if isinstance(meta, dict) else ""
+        if artist and artist.lower() != "unknown artist":
+            return {"id": "", "artist": artist, "title": meta.get("title", ""), "duration_ms": int(meta.get("dur") or 0)}
+        return None
+
     def toggle_like_path(self, path):
         if is_online(path):
             item = self.online_items.get(path)
             if item:
                 self.lib.register_online(item)
         now = self.lib.toggle_like(path)
+        try:
+            ti = self._taste_item_for(path)
+            if ti is not None:
+                self.taste.on_like(ti, bool(now))
+        except Exception:
+            pass
         self.save_soon()
         self._sync_like_button()
         self.stats.setText(f"{len(self.lib.tracks)} songs · {len(self.lib.liked)} liked")
@@ -1605,11 +1759,15 @@ class MusicPlayer(QMainWindow):
         self._search_query = query
 
     def retry_online_search(self):
+        if not self.last_online_query and not self.search.text().strip():
+            self._show_discover(force=True)
+            return
         if self.last_online_query:
             self._search_cache.pop(self.last_online_query.lower(), None)
             self.run_online_search(self.last_online_query)
 
     def _show_results(self, items):
+        self.online.set_discover(False)
         self.online.set_busy(False)
         self.online_results = list(items)
         for it in items:
@@ -1625,7 +1783,10 @@ class MusicPlayer(QMainWindow):
         if token != self._search_token:
             return
         self._search_cache[(getattr(self, "_search_query", "") or self.last_online_query).lower()] = list(items)
-        for it in list(items)[:2]:                     # look up the first songs' stream addresses now: Play starts at once
+        if self._search_explicit:
+            self._search_explicit = False
+            self.taste.on_search(getattr(self, "_search_query", "") or self.last_online_query, items)
+        for it in list(items)[:5]:                     # look up the first songs' stream addresses now: Play starts at once
             self.jobs.prefetch(it)
         while len(self._search_cache) > 40:
             self._search_cache.popitem(last=False)
@@ -1696,6 +1857,8 @@ class MusicPlayer(QMainWindow):
         if target == self.current_path:
             self.toggle_play()
             return
+        if self.last_online_query and not self.online.discover:
+            self.taste.on_search(self.last_online_query, [item])          # a search that led to a song: it counts
         self._set_queue([key], None)               # the song, then an automatic queue of related songs
         self.radio_on = bool(self.lib.settings.get("auto_radio", True))
         self.radio_seed = key
@@ -1779,7 +1942,10 @@ class MusicPlayer(QMainWindow):
             self._set_queue([key], None)
         self._req_t = 0.0
         self._pending_seek = int(start_ms) if start_ms and start_ms > 1500 else None
+        self._taste_finish()
         self._listen_acc = 0.0
+        self._taste_item = dict(item)
+        self.taste.on_play(self._taste_item)
         self.loading_key = key
         self.analyzer.cancel()
         self._analysis_target = ""
@@ -2560,6 +2726,8 @@ class MusicPlayer(QMainWindow):
         self.toast_msg("Recently played cleared", 1800)
 
     def reset_listen_counts(self):
+        self.taste.reset()
+        self._suggest_items = []
         self.lib.play_counts = {}
         self._suggest = self.lib.suggestions(12)
         self.save_soon()
@@ -2570,6 +2738,9 @@ class MusicPlayer(QMainWindow):
     def changeEvent(self, e):
         if e.type() == QEvent.Type.WindowStateChange:
             self.engine.active = not self.isMinimized()
+            if hasattr(self, "_outer"):
+                self._outer.setContentsMargins(*self._margins(self.isMaximized() or self.isFullScreen()))
+                self.titlebar.update()
         super().changeEvent(e)
 
     def resizeEvent(self, e):
@@ -2587,7 +2758,9 @@ class MusicPlayer(QMainWindow):
                 if tm >= 0:
                     self.lib.last_pos = tm
                 self.lib.last_path = self.current_path
+            self._taste_finish()
             self.lib.save()
+            self.taste.save()
             self.presence.stop()
             self.hub.close_all()
             self.jobs.close()

@@ -638,7 +638,7 @@ class SettingsDialog(GlassDialog):
         b2 = GButton("Reset listening statistics", "reset", "glass", 16)
         b2.clicked.connect(self._reset_counts)
         lay.addWidget(SettingRow("Recently played", "Empties the history list on the Home page.", b1))
-        lay.addWidget(SettingRow("Suggestions", "Forget how often you played songs so suggestions start fresh.", b2))
+        lay.addWidget(SettingRow("Suggestions", "Forget how often you played songs and what you like, so suggestions (also Online > Made for you) start fresh.", b2))
         loc = QLabel(f"Library file: {self.lib.file}")
         loc.setObjectName("dlgFreq")
         loc.setWordWrap(True)

@@ -596,26 +596,63 @@ def _json_post_keepalive(host, path, payload, headers, timeout=8):
     raise last
 
 
-def _resolve_quick(vid):
-    """Direct stream address with ONE small request (~0.3 s) instead of loading the whole extractor (~2 s)."""
-    body = {"videoId": vid, "contentCheckOk": True, "racyCheckOk": True,
-            "context": {"client": {"clientName": "ANDROID_VR", "clientVersion": "1.60.19", "deviceMake": "Oculus",
-                                   "deviceModel": "Quest 3", "androidSdkVersion": 32, "osName": "Android",
-                                   "osVersion": "12L", "hl": "en", "gl": "US"}}}
+_QUICK_CLIENTS = (
+    # (name, header id, payload client, user agent)
+    ("ANDROID_VR", "28", {"clientName": "ANDROID_VR", "clientVersion": "1.60.19", "deviceMake": "Oculus",
+                          "deviceModel": "Quest 3", "androidSdkVersion": 32, "osName": "Android", "osVersion": "12L",
+                          "hl": "en", "gl": "US"}, VR_UA),
+    ("IOS", "5", {"clientName": "IOS", "clientVersion": "19.45.4", "deviceMake": "Apple", "deviceModel": "iPhone16,2",
+                  "osName": "iPhone", "osVersion": "18.1.0.22B83", "hl": "en", "gl": "US"},
+     "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"),
+    ("ANDROID_MUSIC", "21", {"clientName": "ANDROID_MUSIC", "clientVersion": "7.27.52", "androidSdkVersion": 30,
+                             "osName": "Android", "osVersion": "11", "hl": "en", "gl": "US"},
+     "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip"),
+)
+
+
+def _quick_one(vid, client):
+    name, cid, ctx, ua = client
+    body = {"videoId": vid, "contentCheckOk": True, "racyCheckOk": True, "context": {"client": ctx}}
     data = _json_post_keepalive(
         "www.youtube.com", "/youtubei/v1/player?prettyPrint=false", json.dumps(body).encode("utf-8"),
-        {"User-Agent": VR_UA, "Content-Type": "application/json", "X-YouTube-Client-Name": "28",
-         "X-YouTube-Client-Version": "1.60.19", "Accept-Encoding": "gzip"})
+        {"User-Agent": ua, "Content-Type": "application/json", "X-YouTube-Client-Name": cid,
+         "X-YouTube-Client-Version": ctx["clientVersion"], "Accept-Encoding": "gzip"})
     if (data.get("playabilityStatus") or {}).get("status") != "OK":
-        raise OnlineError("quick address refused")
+        raise OnlineError(f"{name} refused")
     fmts = [f for f in (data.get("streamingData") or {}).get("adaptiveFormats", [])
             if f.get("url") and str(f.get("mimeType", "")).startswith("audio/")]
     if not fmts:
-        raise OnlineError("no quick audio")
+        raise OnlineError(f"{name}: no audio")
     mp4 = [f for f in fmts if "mp4" in f["mimeType"]]
     pick = max(mp4 or fmts, key=lambda f: int(f.get("bitrate") or 0))
     dur = int(float((data.get("videoDetails") or {}).get("lengthSeconds") or 0) * 1000)
     return pick["url"], dur
+
+
+def _resolve_quick(vid):
+    """Direct stream address, fast: the three app 'clients' are asked AT THE SAME TIME and the first good answer
+    wins (~0.3 s). A song that one client refuses is usually accepted by another."""
+    import queue
+    q = queue.Queue()
+
+    def work(client):
+        try:
+            q.put((True, _quick_one(vid, client)))
+        except Exception as exc:
+            q.put((False, exc))
+
+    for c in _QUICK_CLIENTS:
+        threading.Thread(target=work, args=(c,), daemon=True, name="nilkon-quick").start()
+    errors = []
+    for _ in _QUICK_CLIENTS:
+        ok, val = q.get()
+        if ok:
+            return val
+        errors.append(val)
+    net = [e for e in errors if is_network_error(e)]
+    if len(net) == len(errors):
+        raise net[0]
+    raise OnlineError("quick address refused")
 
 
 def _resolve_piped(vid):

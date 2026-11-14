@@ -21,6 +21,9 @@ VR_UA = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12
 FIRST_CHUNK = 64 * 1024           # small first request: playback can start at once, even on a slow line
 SECOND_CHUNK = 320 * 1024
 CHUNK = 1024 * 1024
+MIN_CHUNK = 128 * 1024
+START_CHUNK = 512 * 1024          # size of the pieces the parallel workers fetch (shrinks if the server refuses big ones)
+WORKERS = 3
 MAX_BYTES = 80 * 1024 * 1024
 OFFLINE_PATIENCE = 75.0           # seconds without internet before a song gives up
 PREFETCH_BYTES = 1536 * 1024
@@ -42,6 +45,13 @@ class Session:
         self.mime = (re.search(r"[?&]mime=([^&]+)", url) or [None, "audio%2Fmp4"])[1].replace("%2F", "/")
         self.ext = ".webm" if "webm" in self.mime else ".m4a"
         self.f_write = None
+        self._wlock = threading.Lock()
+        self._clock = threading.Lock()
+        self._rlock = threading.Lock()
+        self._refreshed = 0.0
+        self._parts = {}
+        self._next = 0
+        self.chunk = START_CHUNK
         self.thread = threading.Thread(target=self._run, daemon=True, name="nilkon-spool")
         self.thread.start()
 
@@ -51,70 +61,197 @@ class Session:
         return urllib.request.urlopen(req, timeout=15)
 
     def _ua(self):
-        return VR_UA if "c=ANDROID_VR" in self.url else USER_AGENT
+        if "c=ANDROID_VR" in self.url:
+            return VR_UA
+        if "c=IOS" in self.url:
+            return "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"
+        if "c=ANDROID_MUSIC" in self.url:
+            return "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip"
+        return USER_AGENT
 
-    def _run(self):
-        try:
-            self.f_write = open(self.path, "wb")
-            fails = 0
-            offline_since = None
-            while not self.closed:
-                start = self.have
-                if self.size is not None and start >= self.size:
-                    break
-                if start >= min(self.limit, MAX_BYTES):
-                    with self.cond:
-                        self.cond.wait(0.3)
-                    continue
-                n = FIRST_CHUNK if start == 0 else SECOND_CHUNK if start < FIRST_CHUNK + SECOND_CHUNK else CHUNK
+    # -- parallel downloader ------------------------------------------------------------------------
+    def _fetch(self, conn_box, start, end):
+        """One ranged request over a kept-alive connection (no new TLS handshake per chunk)."""
+        import http.client
+        from urllib.parse import urlsplit
+        url = self.url
+        u = urlsplit(url)
+        path = u.path + ("?" + u.query if u.query else "")
+        hdr = {"User-Agent": self._ua(), "Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
+        for attempt in range(2):
+            c = conn_box.get("c") if attempt == 0 and conn_box.get("host") == u.netloc else None
+            if c is None:
+                cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+                c = conn_box["c"] = cls(u.netloc, timeout=15)
+                conn_box["host"] = u.netloc
+            try:
+                c.request("GET", path, headers=hdr)
+                r = c.getresponse()
+                data = r.read()
+                if r.status in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+                    req = urllib.request.Request(r.headers["Location"], headers=hdr)
+                    with urllib.request.urlopen(req, timeout=15) as r2:
+                        return r2.status, r2.headers.get("Content-Range", ""), r2.read()
+                if r.status >= 400:
+                    raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, None)
+                return r.status, r.headers.get("Content-Range", ""), data
+            except urllib.error.HTTPError:
+                raise
+            except Exception:
                 try:
-                    with self._open(start, start + n - 1) as r:
-                        data = r.read()
-                        cr = r.headers.get("Content-Range", "")
-                        if self.size is None:
-                            tail = cr.rsplit("/", 1)[-1]
-                            if tail.isdigit():
-                                self.size = int(tail)
-                            elif r.status == 200:
-                                self.size = len(data)
-                        if r.status == 200 and start > 0:        # server ignored the range
-                            data = data[start:]
+                    c.close()
+                except Exception:
+                    pass
+                conn_box.pop("c", None)
+                if attempt:
+                    raise
+        raise OSError("request failed")
+
+    def _store(self, off, data):
+        with self._wlock:
+            self.f_write.seek(off)
+            self.f_write.write(data)
+            self.f_write.flush()
+        with self.cond:
+            self._parts[off] = len(data)
+            while self.have in self._parts:
+                self.have += self._parts.pop(self.have)
+            self.cond.notify_all()
+
+    def _claim(self):
+        """Next piece of the song for a worker: (offset, length), or None when everything is taken."""
+        with self._clock:
+            start = self._next
+            top = min(self.size or 0, self.limit, MAX_BYTES)
+            if start >= top:
+                return None
+            n = min(self.chunk, top - start)
+            self._next = start + n
+            return start, n
+
+    def _worker(self):
+        box = {}
+        fails = 0
+        offline_since = None
+        while not self.closed and not self.error:
+            if self._wait_limit():
+                continue
+            job = self._claim()
+            if job is None:
+                if self._all_claimed():
+                    return
+                with self.cond:
+                    self.cond.wait(0.3)
+                continue
+            start, n = job
+            pos, stop = start, start + n
+            while pos < stop and not self.closed and not self.error:
+                m = min(stop - pos, self.chunk)                 # the piece may shrink if the server refuses big ones
+                try:
+                    status, cr, data = self._fetch(box, pos, pos + m - 1)
+                    if status == 200 and pos > 0:               # the server ignored the range
+                        data = data[pos:pos + m]
+                    if len(data) < m and pos + len(data) < (self.size or 0):
+                        raise OSError("short read")
+                    self._store(pos, data)
+                    pos += len(data)
+                    fails = 0
+                    offline_since = None
                 except urllib.error.HTTPError as exc:
                     fails += 1
-                    if exc.code in (403, 404, 410) and self.refresh and fails <= 2:
-                        try:
-                            self.url = self.refresh() or self.url
-                        except Exception:
-                            pass
-                    if fails > 4:
+                    if exc.code in (403, 404, 410):
+                        if m > MIN_CHUNK:
+                            self.chunk = max(MIN_CHUNK, m // 2)
+                        self._refresh_url()
+                    if fails > 8:
                         self.error = f"HTTP {exc.code}"
-                        break
-                    time.sleep(0.4 * fails)
-                    continue
+                        return
+                    time.sleep(min(2.0, 0.2 * fails))
                 except Exception as exc:
                     # no connection: keep trying for a while (a short outage must not stop the song)
                     if offline_since is None:
                         offline_since = time.monotonic()
                     if time.monotonic() - offline_since > OFFLINE_PATIENCE or self.closed:
                         self.error = str(exc)
-                        break
-                    time.sleep(min(3.0, 0.5 + 0.5 * fails))
+                        return
                     fails += 1
+                    time.sleep(min(3.0, 0.4 + 0.4 * fails))
+
+    def _refresh_url(self):
+        if not self.refresh:
+            return
+        with self._rlock:
+            if time.monotonic() - self._refreshed < 2.0:
+                return                                      # another worker has just done it
+            try:
+                self.url = self.refresh() or self.url
+            except Exception:
+                pass
+            self._refreshed = time.monotonic()
+
+    def _wait_limit(self):
+        """A prefetched song only downloads its first part until it is played."""
+        if self._next >= min(self.limit, MAX_BYTES) and not (self.size is not None and self._next >= self.size):
+            with self.cond:
+                self.cond.wait(0.3)
+            return True
+        return False
+
+    def _all_claimed(self):
+        return self.size is not None and self._next >= self.size
+
+    def _run(self):
+        workers = []
+        try:
+            self.f_write = open(self.path, "wb")
+            fails = 0
+            offline_since = None
+            box = {}
+            while self.size is None and not self.closed:        # first small piece: gives the song size, playback starts
+                try:
+                    status, cr, data = self._fetch(box, 0, FIRST_CHUNK - 1)
+                except urllib.error.HTTPError as exc:
+                    fails += 1
+                    if exc.code in (403, 404, 410):
+                        self._refresh_url()
+                    if fails > 5:
+                        self.error = f"HTTP {exc.code}"
+                        return
+                    time.sleep(0.3 * fails)
                     continue
-                offline_since = None
-                if not data:
-                    if self.size is None:
-                        self.size = self.have
-                    break
-                fails = 0
-                self.f_write.write(data)
-                self.f_write.flush()
+                except Exception as exc:
+                    if offline_since is None:
+                        offline_since = time.monotonic()
+                    if time.monotonic() - offline_since > OFFLINE_PATIENCE:
+                        self.error = str(exc)
+                        return
+                    fails += 1
+                    time.sleep(min(3.0, 0.5 + 0.5 * fails))
+                    continue
+                tail = cr.rsplit("/", 1)[-1]
+                total = int(tail) if tail.isdigit() else len(data) if status == 200 else None
+                if status == 200:
+                    data = data[:total] if total else data
+                if total is None or not data:
+                    self.error = "unknown size"
+                    return
+                self._store(0, data)
                 with self.cond:
-                    self.have += len(data)
+                    self._next = len(data)
+                    self.size = total
                     self.cond.notify_all()
+            for i in range(WORKERS):
+                t = threading.Thread(target=self._worker, daemon=True, name=f"nilkon-spool-{i}")
+                t.start()
+                workers.append(t)
+            for t in workers:
+                while t.is_alive() and not self.closed:
+                    t.join(0.3)
         except Exception as exc:
             self.error = str(exc)
         finally:
+            for t in workers:
+                t.join(timeout=2)
             with self.cond:
                 if self.size is None:
                     self.size = self.have

@@ -59,6 +59,13 @@ Data is stored in `~/.nilkon_music`. Renaming a song changes its display name on
 - Waves for local and online songs start within a fraction of a second (progressive analysis) and no longer jump when the analysis completes.
 - Buttons, sliders and menus now follow the song colours.
 
+## 1.8.0 - speed, suggestions, new title bar
+- Online songs load faster: three stream lookups race in parallel, the song downloads in parallel pieces over
+  kept-alive connections, and the first results are looked up in advance.
+- Online page: "Made for you" suggestions - random at first, then they follow what you search, play, like and skip.
+  Settings > Library > Reset listening statistics also resets this.
+- New themed window bar (minimise / maximise / close) that follows the colour theme.
+
 ## 1.7.2 - connection handling
 - No internet (or it drops while a song plays): NILKON waits, shows "Waiting for internet…", and continues the same song
   from the same second as soon as the connection is back. Searches and pictures that failed offline repeat by themselves.
