@@ -59,6 +59,15 @@ Data is stored in `~/.nilkon_music`. Renaming a song changes its display name on
 - Waves for local and online songs start within a fraction of a second (progressive analysis) and no longer jump when the analysis completes.
 - Buttons, sliders and menus now follow the song colours.
 
+## 1.9.0 - downloads, home shelves, tray, playlists
+- Download: parallel pieces (much faster), written to a temporary folder and moved in place with retries, so the
+  "WinError 32 ... used by another process" error and refused downloads are gone. The old engine stays as a fallback.
+- Online page (no search): Spotify-style rows of cover cards with arrows on both sides; a search shows the normal list.
+- The close button hides NILKON in the tray (Settings > Appearance to change); quit from the tray icon.
+- Flat, simple window bar.
+- Playlists: share (copy a share code or save a .nilkon file) and import (share code, .nilkon, Spotify CSV from
+  exportify.net, or a text list). Sidebar: Playlists > + and the playlist's right-click menu.
+
 ## 1.8.0 - speed, suggestions, new title bar
 - Online songs load faster: three stream lookups race in parallel, the song downloads in parallel pieces over
   kept-alive connections, and the first results are looked up in advance.

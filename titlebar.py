@@ -1,4 +1,4 @@
-"""Custom window title bar in the NILKON liquid-glass style (the window itself has no system frame).
+"""Custom window title bar: flat, quiet and theme-aware (the window itself has no system frame).
 
 Drag the bar to move the window (Windows snap works), double-click to maximise / restore, right-click for the window
 menu. The colours follow the player theme, so the bar always matches the song colours and dark / light mode.
@@ -9,9 +9,10 @@ from PySide6.QtWidgets import QMenu, QWidget
 
 from theme import T, alpha, ink, surface
 
-BAR_H = 40
+BAR_H = 38
 BTN_W = 46
-BTN_H = 30
+BTN_H = BAR_H
+RADIUS = 14
 CLOSE_RED = QColor(232, 72, 85)
 
 
@@ -39,12 +40,11 @@ class TitleBar(QWidget):
         return self._win.isMaximized() or self._win.isFullScreen()
 
     def _button_rects(self):
-        right = self.width() - 8
-        y = (self.height() - BTN_H) / 2.0
+        right = float(self.width())
         rects = []
         for i in (2, 1, 0):
-            rects.append((i, QRectF(right - BTN_W, y, BTN_W, BTN_H)))
-            right -= BTN_W + 2
+            rects.append((i, QRectF(right - BTN_W, 0, BTN_W, BTN_H)))
+            right -= BTN_W
         return dict(rects), right
 
     def _button_at(self, pos):
@@ -59,35 +59,28 @@ class TitleBar(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(0, 0, self.width(), self.height() + RADIUS * 2), RADIUS, RADIUS)
+        p.setClipPath(clip)
 
-        # glass strip
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(surface(0.46 if T.dark else 0.55))
-        p.drawRoundedRect(r, 14, 14)
-        g = QLinearGradient(r.topLeft(), r.topRight())
-        g.setColorAt(0.0, alpha(T.c1, 0.16))
-        g.setColorAt(0.5, alpha(T.c2, 0.05))
-        g.setColorAt(1.0, alpha(T.c3, 0.14))
-        p.setBrush(g)
-        p.drawRoundedRect(r, 14, 14)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(ink(0.10), 1))
-        p.drawRoundedRect(r, 14, 14)
+        # flat strip with one hairline underneath
+        p.fillRect(self.rect(), surface(0.34 if T.dark else 0.50))
+        p.fillRect(QRectF(0, self.height() - 1, self.width(), 1), ink(0.07))
 
         # logo + name
         x = 14
         if self._icon is not None and not self._icon.isNull():
             pm = self._icon.pixmap(48, 48)
             if not pm.isNull():
-                p.drawPixmap(QRectF(x, (self.height() - 22) / 2.0, 22, 22).toRect(), pm)
-                x += 22 + 9
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                p.drawPixmap(QRectF(x, (self.height() - 18) / 2.0, 18, 18).toRect(), pm)
+                x += 18 + 9
         f = QFont(self.font())
-        f.setPointSizeF(9.2)
-        f.setWeight(QFont.Weight.Bold)
-        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.4)
+        f.setPointSizeF(8.6)
+        f.setWeight(QFont.Weight.DemiBold)
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2.0)
         p.setFont(f)
-        p.setPen(ink(0.92))
+        p.setPen(ink(0.80))
         name = "NILKON"
         nm_w = QFontMetrics(f).horizontalAdvance(name)
         p.drawText(QRectF(x, 0, nm_w + 4, self.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
@@ -113,7 +106,7 @@ class TitleBar(QWidget):
                 box = QRectF(self.width() / 2.0 - avail / 2.0, 0, avail, self.height())
                 align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
             if avail > 30:
-                p.setPen(ink(0.66))
+                p.setPen(ink(0.55))
                 p.drawText(box, align, fm.elidedText(self._title, Qt.TextElideMode.ElideRight, int(box.width())))
         p.end()
 
@@ -123,35 +116,33 @@ class TitleBar(QWidget):
         close = i == 2
         if hot:
             if close:
-                p.setBrush(QColor(CLOSE_RED.red(), CLOSE_RED.green(), CLOSE_RED.blue(), 235 if down else 255))
+                p.fillRect(br, QColor(CLOSE_RED.red(), CLOSE_RED.green(), CLOSE_RED.blue(), 215 if down else 255))
             else:
-                p.setBrush(alpha(T.c1, 0.34 if down else 0.24))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(br, 10, 10)
-        col = QColor(255, 255, 255) if (hot and close) else ink(0.95 if hot else 0.72)
-        pen = QPen(col, 1.4)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                p.fillRect(br, ink(0.12 if down else 0.075))
+        col = QColor(255, 255, 255) if (hot and close) else ink(0.95 if hot else 0.66)
+        pen = QPen(col, 1.15)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
         c = br.center()
-        s = 5.0
+        s = 4.6
         if i == 0:
             p.drawLine(QPointF(c.x() - s, c.y() + 0.5), QPointF(c.x() + s, c.y() + 0.5))
         elif i == 1:
             if self._maximized():
-                p.drawRoundedRect(QRectF(c.x() - s, c.y() - s + 2.2, 2 * s - 2.2, 2 * s - 2.2), 1.6, 1.6)
+                p.drawRect(QRectF(c.x() - s, c.y() - s + 2.0, 2 * s - 2.0, 2 * s - 2.0))
                 path = QPainterPath()
-                path.moveTo(c.x() - s + 2.6, c.y() - s + 2.2 - 0.0)
-                path.lineTo(c.x() - s + 2.6, c.y() - s)
-                path.lineTo(c.x() + s - 0.0, c.y() - s)
-                path.lineTo(c.x() + s, c.y() + s - 2.6)
-                path.lineTo(c.x() + s - 2.2, c.y() + s - 2.6)
+                path.moveTo(c.x() - s + 2.0, c.y() - s + 2.0)
+                path.lineTo(c.x() - s + 2.0, c.y() - s)
+                path.lineTo(c.x() + s, c.y() - s)
+                path.lineTo(c.x() + s, c.y() + s - 2.0)
+                path.lineTo(c.x() + s - 2.0, c.y() + s - 2.0)
                 p.drawPath(path)
             else:
-                p.drawRoundedRect(QRectF(c.x() - s, c.y() - s, 2 * s, 2 * s), 2.0, 2.0)
+                p.drawRect(QRectF(c.x() - s, c.y() - s, 2 * s, 2 * s))
         else:
-            d = s - 0.4
+            d = s
             p.drawLine(QPointF(c.x() - d, c.y() - d), QPointF(c.x() + d, c.y() + d))
             p.drawLine(QPointF(c.x() - d, c.y() + d), QPointF(c.x() + d, c.y() - d))
 

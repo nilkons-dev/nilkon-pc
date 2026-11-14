@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListW
                                QStyledItemDelegate, QStackedWidget, QAbstractItemView)
 
 from icons import draw_icon, qicon
+from shelves import ShelvesView
 from theme import T, alpha, ink, hsv, nice_time, text_baseline
 from tracklist import draw_thumb
 from visuals import draw_mini_bars
@@ -313,6 +314,10 @@ class OnlinePage(QWidget):
         self.stack = QStackedWidget()
         self.stack.addWidget(self.list)
         self.stack.addWidget(self.msg)
+        self.shelves = ShelvesView(host)
+        self.shelves.playRequested.connect(self.playRequested)
+        self.shelves.menuRequested.connect(self.menuRequested)
+        self.stack.addWidget(self.shelves)
         lay.addWidget(self.stack, 1)
         self.show_message("idle")
 
@@ -368,5 +373,25 @@ class OnlinePage(QWidget):
         self.stack.setCurrentIndex(0)
         self.list.scrollToTop()
 
+    def set_shelves(self, shelves):
+        """The idle state of the page: rows of suggested songs (Spotify style)."""
+        if not shelves:
+            self.show_message("empty")
+            return
+        self.shelves.set_shelves(shelves)
+        self.stack.setCurrentIndex(2)
+
+    def set_shelves(self, shelves):
+        """The idle state of the page: rows of suggested songs (Spotify style)."""
+        if not shelves:
+            self.show_message("empty")
+            return
+        self.shelves.set_shelves(shelves)
+        self.stack.setCurrentIndex(2)
+
     def repaint_rows(self):
         self.list.viewport().update()
+        if self.stack.currentIndex() == 2:
+            self.shelves.repaint_all()
+        if self.stack.currentIndex() == 2:
+            self.shelves.repaint_all()

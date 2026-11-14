@@ -32,8 +32,10 @@ class OnlineJobs(QObject):
     cacheFailed = Signal(str)
     networkChecked = Signal(bool)
     prefetched = Signal(str, str)             # key, stream address (resolved in advance)
-    suggestDone = Signal(int, object, str)    # token, items, label
+    suggestDone = Signal(int, object, str)    # token, shelves [(title, subtitle, items)], label
     suggestFailed = Signal(int, str)
+    importProgress = Signal(int, int, int)    # token, done, total
+    importDone = Signal(int, str, object, int)   # token, playlist name, items, songs not found
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -116,11 +118,57 @@ class OnlineJobs(QObject):
 
     def _suggest(self, token, taste, n):
         try:
-            items, label = taste.build(n, online.search, online.related)
+            items, label = taste.build_shelves(online.search, online.related)
         except Exception as exc:
             self._emit("suggestFailed", token, online.friendly_error(exc))
             return
         self._emit("suggestDone", token, list(items), label)
+
+    def import_entries(self, name, entries):
+        """Turns a list of wanted songs (from a share code / Spotify CSV) into online songs, matching by search."""
+        with self._lock:
+            self._token += 1
+            token = self._token
+        self._submit(self._import, token, name, list(entries))
+        return token
+
+    def _import(self, token, name, entries):
+        import playlist_share
+        total = len(entries)
+        done = [0]
+        out = [None] * total
+        lock = threading.Lock()
+
+        def one(i):
+            e = entries[i]
+            try:
+                if self._closed:
+                    return
+                if e.get("id"):
+                    vid = e["id"]
+                    out[i] = online.make_item("youtube", vid, e["title"], e.get("artist", ""), e.get("duration_ms", 0),
+                                              f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+                                              f"https://www.youtube.com/watch?v={vid}")
+                else:
+                    q = f"{e.get('artist', '')} {e['title']}".strip()
+                    for attempt in range(2):
+                        try:
+                            res = online.search(q, 6)
+                            break
+                        except Exception:
+                            res = []
+                            time.sleep(0.5)
+                    out[i] = playlist_share.pick_match(e, res)
+            finally:
+                with lock:
+                    done[0] += 1
+                    n = done[0]
+                if n == total or n % 3 == 0:
+                    self._emit("importProgress", token, n, total)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(one, range(total)))
+        items = [x for x in out if x]
+        self._emit("importDone", token, name, items, total - len(items))
 
     def related(self, item):
         self._submit(self._related, item)

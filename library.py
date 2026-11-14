@@ -38,6 +38,7 @@ DEFAULT_SETTINGS = {
     "volume_step": 5,               # keyboard volume step
     "seek_step": 10,                # seconds, Alt+Left / Alt+Right
     "start_page": "home",           # home | online
+    "close_to_tray": True,          # the close button hides NILKON in the tray (music keeps playing)
     "title_song": True,             # show the song name in the window title
     "toasts": True,                 # small pop-up messages
     "wave_gain": 100,               # % wave sensitivity

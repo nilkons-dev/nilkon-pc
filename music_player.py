@@ -45,7 +45,7 @@ from PySide6.QtCore import Qt, QEvent, QFile, QPropertyAnimation, QEasingCurve, 
 from PySide6.QtGui import QDesktopServices, QColor, QFont, QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap, QRadialGradient, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QFileDialog, QLineEdit, QMessageBox, QAbstractItemView, QMenu, QStackedWidget, QSizePolicy)
+    QFileDialog, QLineEdit, QMessageBox, QAbstractItemView, QMenu, QStackedWidget, QSizePolicy, QSystemTrayIcon)
 
 import tags
 from appinfo import APP_NAME
@@ -199,12 +199,15 @@ class MusicPlayer(QMainWindow):
 
         self.taste = Taste(self.lib.dir)
         self._suggest_items = []
+        self._suggest_shelves = []
         self._suggest_label = "Made for you"
         self._suggest_token = None
         self._suggest_t = 0.0
         self._taste_item = None
         self._search_explicit = False
         self.jobs = OnlineJobs(self)
+        self.jobs.importProgress.connect(self._on_import_progress)
+        self.jobs.importDone.connect(self._on_import_done)
         self.jobs.suggestDone.connect(self._on_suggest_done)
         self.jobs.suggestFailed.connect(self._on_suggest_failed)
         self.jobs.searchDone.connect(self._on_search_done)
@@ -243,6 +246,7 @@ class MusicPlayer(QMainWindow):
         online.COOKIE_BROWSER[0] = s.get("cookie_browser", "")
         self.presence.configure(s["discord_enabled"], s["discord_app_id"])
         self.build_ui()
+        self._setup_tray()
         QApplication.instance().setStyleSheet(build_qss())
         self.apply_all_settings()
         self.volume.setValue(int(s["volume"]))
@@ -448,8 +452,8 @@ class MusicPlayer(QMainWindow):
         head.addStretch(1)
         add_pl = GButton("", "plus", "flat", 15)
         add_pl.setFixedSize(30, 30)
-        add_pl.setToolTip("Create a new playlist")
-        add_pl.clicked.connect(lambda: self.create_playlist())
+        add_pl.setToolTip("New playlist / import a playlist")
+        add_pl.clicked.connect(self.playlist_plus_menu)
         head.addWidget(add_pl)
         lay.addLayout(head)
 
@@ -774,12 +778,12 @@ class MusicPlayer(QMainWindow):
 
     # -- online: personal suggestions ("Made for you") ---------------------------------------------
     def _show_discover(self, force=False):
-        """The Online page without a search: songs picked from what the user searches, plays and likes."""
-        fresh = self._suggest_items and _time.monotonic() - self._suggest_t < 600
+        """The Online page without a search: rows of songs picked from what the user searches, plays and likes."""
+        fresh = self._suggest_shelves and _time.monotonic() - self._suggest_t < 600
         if fresh and not force:
             self.online_results = list(self._suggest_items)
             self.online.set_discover(True, self._suggest_label)
-            self.online.set_results(self._suggest_items)
+            self.online.set_shelves(self._suggest_shelves)
             return
         self.request_suggestions()
 
@@ -789,28 +793,28 @@ class MusicPlayer(QMainWindow):
     def request_suggestions(self):
         self.online.set_discover(True, self._suggest_label)
         self.online.set_discover_busy(True)
-        if not self._suggest_items or self.online.stack.currentIndex() == 1:
+        if not self._suggest_shelves or self.online.stack.currentIndex() == 1:
             self.online.show_message("loading")
         self._suggest_token = self.jobs.suggest(self.taste)
 
-    def _on_suggest_done(self, token, items, label):
+    def _on_suggest_done(self, token, shelves, label):
         if token != self._suggest_token:
             return
-        self._suggest_items = list(items)
+        shelves = [(t, s, list(its)) for t, s, its in shelves if its]
+        flat = [it for _, _, its in shelves for it in its]
+        self._suggest_shelves = shelves
+        self._suggest_items = flat
         self._suggest_label = label
         self._suggest_t = _time.monotonic()
-        for it in items:
+        for it in flat:
             self.online_items.setdefault(it["key"], it)
             self.lib.see_online(it)
-        for it in items[:5]:                           # look up the first songs now: Play starts at once
+        for it in flat[:5]:                            # look up the first songs now: Play starts at once
             self.jobs.prefetch(it)
         if self.page == "online" and not self.search.text().strip():
-            self.online_results = list(items)
+            self.online_results = list(flat)
             self.online.set_discover(True, label)
-            if items:
-                self.online.set_results(items)
-            else:
-                self.online.show_message("empty")
+            self.online.set_shelves(shelves)
         else:
             self.online.set_discover_busy(False)
 
@@ -819,7 +823,7 @@ class MusicPlayer(QMainWindow):
             return
         self.online.set_discover_busy(False)
         if self.page == "online" and not self.search.text().strip():
-            if self._suggest_items:
+            if self._suggest_shelves:
                 self.toast_msg(msg, 3200)
             else:
                 self.online.set_discover(False)
@@ -2455,6 +2459,113 @@ class MusicPlayer(QMainWindow):
         if self.page == "collection" and self.current_collection == name:
             self.refresh_collection()
 
+    # -- playlists: share / import ------------------------------------------------------------------------
+    def playlist_plus_menu(self):
+        ic = ink(0.9)
+        menu = style_menu(QMenu(self))
+        a_new = menu.addAction(qicon("plus", ic, 16), "New playlist…")
+        menu.addSeparator()
+        a_file = menu.addAction(qicon("download", ic, 16), "Import from a file (.nilkon, Spotify CSV, list)…")
+        a_code = menu.addAction(qicon("link", ic, 16), "Import from a share code…")
+        btn = self.sender()
+        pos = btn.mapToGlobal(btn.rect().bottomLeft()) if btn is not None else self.cursor().pos()
+        chosen = menu.exec(pos)
+        if chosen == a_new:
+            self.create_playlist()
+        elif chosen == a_file:
+            self.import_playlist_file()
+        elif chosen == a_code:
+            self.import_playlist_code()
+
+    def share_playlist_code(self, name):
+        import playlist_share
+        ents = playlist_share.entries_from_playlist(self.lib, name)
+        if not ents:
+            self.toast_msg("This playlist is empty", 1800)
+            return
+        QApplication.clipboard().setText(playlist_share.to_code(name, ents))
+        notice(self, "Share code copied",
+               f"The code of “{name}” is in your clipboard.\nSend it to a friend (WhatsApp, Telegram, anywhere). "
+               "They open NILKON, press + next to Playlists and choose “Import from a share code”.", "link")
+
+    def share_playlist_file(self, name):
+        import playlist_share
+        ents = playlist_share.entries_from_playlist(self.lib, name)
+        if not ents:
+            self.toast_msg("This playlist is empty", 1800)
+            return
+        safe = "".join(c for c in name if c not in '<>:"/\\|?*').strip() or "playlist"
+        path, _ = QFileDialog.getSaveFileName(self, "Save playlist", str(Path.home() / "Music" / f"{safe}.nilkon"),
+                                              "NILKON playlist (*.nilkon)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(playlist_share.to_file_text(name, ents), encoding="utf-8")
+        except OSError as exc:
+            notice(self, "Couldn't save the file", str(exc))
+            return
+        self.toast_msg("Playlist saved - send the file to a friend")
+
+    def import_playlist_file(self):
+        import playlist_share
+        path, _ = QFileDialog.getOpenFileName(self, "Import playlist", str(Path.home()),
+                                              "Playlists (*.nilkon *.csv *.txt *.json);;All files (*)")
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+            name, entries = playlist_share.parse_file_text(text, path)
+        except (OSError, playlist_share.ImportError_) as exc:
+            notice(self, "Couldn't import", str(exc))
+            return
+        self._start_import(name, entries)
+
+    def import_playlist_code(self):
+        import playlist_share
+        text, ok = ask_text(self, "Import from a share code", "Paste the NILKON share code you received.",
+                            placeholder="NILKON-PL1:…", ok_text="Import", icon="link", max_len=200000)
+        if not ok:
+            return
+        try:
+            name, entries = playlist_share.parse_code(text)
+        except playlist_share.ImportError_ as exc:
+            notice(self, "Couldn't import", str(exc))
+            return
+        self._start_import(name, entries)
+
+    def _start_import(self, name, entries):
+        self._import_token = self.jobs.import_entries(name, entries)
+        self.toast_msg(f"Importing “{name}” - {len(entries)} songs…", 2500)
+
+    def _on_import_progress(self, token, done, total):
+        if token == getattr(self, "_import_token", None) and done < total:
+            self.toast_msg(f"Importing… {done}/{total}", 1200)
+
+    def _on_import_done(self, token, name, items, missed):
+        if token != getattr(self, "_import_token", None):
+            return
+        if not items:
+            notice(self, "Nothing imported", "None of the songs could be found online. Check your internet and try again.")
+            return
+        base, n = (name.strip() or "Imported playlist"), 1
+        final = base
+        while final in self.lib.playlists or final in (ALL, LIKED, RECENT):
+            n += 1
+            final = f"{base} ({n})"
+        good, msg = self.lib.create_playlist(final)
+        if not good:
+            notice(self, "Can't create playlist", msg)
+            return
+        for it in items:
+            self.online_items.setdefault(it["key"], it)
+            self.lib.register_online(it)
+            self.lib.add_to_playlist(final, it["key"])
+        self.save_soon()
+        self.refresh_all()
+        for it in items[:3]:
+            self.jobs.prefetch(it)
+        self.toast_msg(f"Imported “{final}”: {len(items)} songs" + (f" ({missed} not found)" if missed else ""), 4200)
+
     def playlist_context_menu(self, pos):
         item = self.playlist_list.itemAt(pos)
         if item is None:
@@ -2464,9 +2575,16 @@ class MusicPlayer(QMainWindow):
         menu = style_menu(QMenu(self))
         play = menu.addAction(qicon("play", ic, 16), "Play playlist")
         rename = menu.addAction(qicon("edit", ic, 16), "Rename playlist…")
+        share_menu = style_menu(menu.addMenu(qicon("link", ic, 16), "Share playlist"))
+        share_code = share_menu.addAction("Copy share code")
+        share_file = share_menu.addAction("Save as a file (.nilkon)…")
         delete = menu.addAction(qicon("trash", ic, 16), "Delete playlist")
         chosen = menu.exec(self.playlist_list.viewport().mapToGlobal(pos))
-        if chosen == play:
+        if chosen == share_code:
+            self.share_playlist_code(name)
+        elif chosen == share_file:
+            self.share_playlist_file(name)
+        elif chosen == play:
             paths = self.lib.collection(name)
             if paths:
                 self._set_queue(paths, name)
@@ -2728,6 +2846,7 @@ class MusicPlayer(QMainWindow):
     def reset_listen_counts(self):
         self.taste.reset()
         self._suggest_items = []
+        self._suggest_shelves = []
         self.lib.play_counts = {}
         self._suggest = self.lib.suggestions(12)
         self.save_soon()
@@ -2751,7 +2870,70 @@ class MusicPlayer(QMainWindow):
         if hasattr(self, "tracklist"):
             QTimer.singleShot(0, self._sync_header_inset)
 
+    # -- tray ---------------------------------------------------------------------------------------
+    def _setup_tray(self):
+        self.tray = None
+        self._quitting = False
+        self._tray_hint_shown = False
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        tray = QSystemTrayIcon(app_icon(), self)
+        tray.setToolTip(APP_NAME)
+        menu = QMenu()
+        self._tray_show = menu.addAction("Open NILKON")
+        self._tray_show.triggered.connect(self.show_from_tray)
+        menu.addSeparator()
+        self._tray_play = menu.addAction("Play / Pause")
+        self._tray_play.triggered.connect(self.toggle_play)
+        menu.addAction("Next song").triggered.connect(self.next_track)
+        menu.addAction("Previous song").triggered.connect(self.previous_track)
+        menu.addSeparator()
+        menu.addAction("Quit NILKON").triggered.connect(self.quit_app)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._tray_activated)
+        self._tray_menu = menu
+        self.tray = tray
+        tray.show()
+        QApplication.instance().setQuitOnLastWindowClosed(False)
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.show_from_tray()
+
+    def show_from_tray(self):
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        self._quitting = True
+        self.close()
+        QApplication.instance().quit()
+
     def closeEvent(self, event):
+        if (not self._quitting and getattr(self, "tray", None) is not None and self.tray.isVisible()
+                and self.lib.settings.get("close_to_tray", True)
+                and not QApplication.instance().isSavingSession()):
+            event.ignore()
+            self.hide()                                  # keeps playing - Quit is in the tray menu
+            self.lib.save()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.showMessage(APP_NAME, "NILKON is still running here. Click the icon to open it, "
+                                      "right-click it to quit.", QSystemTrayIcon.MessageIcon.Information, 4000)
+            return
+        self._shutdown()
+        if getattr(self, "tray", None) is not None:
+            self.tray.hide()
+        event.accept()
+
+    def _shutdown(self):
+        if getattr(self, "_down", False):
+            return
+        self._down = True
         try:
             if self.current_path and not is_online(self.current_path):
                 tm = self.player.get_time()
@@ -2770,8 +2952,8 @@ class MusicPlayer(QMainWindow):
             self.player.stop()
             self.covers.close()
             self._meta_pool.shutdown(wait=False, cancel_futures=True)
-        finally:
-            event.accept()
+        except Exception:
+            pass
 
 
 def main():

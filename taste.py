@@ -291,3 +291,95 @@ class Taste:
             del self.shown[:-SHOWN_MAX]
             self._dirty = True
         return out, label
+
+    def build_shelves(self, search_fn, related_fn, rnd=None, per_shelf=16):
+        """-> (shelves, label).  shelves = [(title, subtitle, [items])] for the Spotify-style Online home.
+        The first shelf is the personal mix; the others follow the favourite songs / artists / searches
+        (or are random genres while the profile is still empty)."""
+        rnd = rnd or random.Random()
+        with self.lock:
+            artists = dict(self.artists)
+            terms = dict(self.terms)
+            seeds = {k: dict(v) for k, v in self.seeds.items()}
+            played = set(self.played)
+        cold = self.strength() < COLD_LIMIT
+        specs = []          # (title, subtitle, fn)
+        if cold:
+            subtitle0 = "Random picks to get started"
+            for q in rnd.sample(CURATED, 5):
+                specs.append((q, "Popular right now", lambda q=q: search_fn(q, 18)))
+        else:
+            subtitle0 = "Inspired by your recent activity"
+            for sid in self._pick([(k, s.get("w", 0)) for k, s in seeds.items()], 2, rnd):
+                s = seeds[sid]
+                it = {"id": s["id"], "key": "online:youtube:" + s["id"], "title": s.get("title", ""),
+                      "artist": s.get("artist", ""), "provider": "youtube"}
+                specs.append(("Because you listened to " + (s.get("title") or "this")[:40], "Similar songs",
+                              lambda it=it: related_fn(it, 24)))
+            used = set()
+            for a in self._pick([(k, v) for k, v in artists.items() if v >= 1.0], 2, rnd):
+                used.add(a)
+                specs.append(("More like " + a.title(), "Artists you keep coming back to", lambda a=a: search_fn(a, 18)))
+            for t in self._pick([(k, v) for k, v in terms.items() if k not in used], 1, rnd):
+                specs.append(("Because you searched " + t, "Based on your searches", lambda t=t: search_fn(t, 18)))
+            for q in rnd.sample(CURATED, 2):
+                specs.append((q, "Something different", lambda q=q: search_fn(q, 18)))
+        errors = []
+
+        def run(spec):
+            try:
+                return list(spec[2]() or [])
+            except Exception as exc:
+                errors.append(exc)
+                return []
+        mix_box = {}
+
+        def mix():
+            try:
+                mix_box["items"], mix_box["label"] = self.build(per_shelf + 8, search_fn, related_fn, rnd)
+            except Exception as exc:
+                errors.append(exc)
+                mix_box["items"], mix_box["label"] = [], "Made for you"
+        t = threading.Thread(target=mix, daemon=True)
+        t.start()
+        with ThreadPoolExecutor(max_workers=min(5, max(1, len(specs)))) as pool:
+            lists = list(pool.map(run, specs))
+        t.join(timeout=40)
+        taken, sigs = set(), set()
+        shelves = []
+
+        def clean(items, limit):
+            fresh = [i for i in items if i.get("id") not in played]
+            pool_ = fresh if len(fresh) >= 6 else items
+            out, per_artist = [], {}
+            for it in pool_:
+                vid = it.get("id")
+                dur = int(it.get("duration_ms") or 0)
+                if not vid or vid in taken or (dur and not (60_000 <= dur <= 15 * 60_000)):
+                    continue
+                sig = _song_sig(it)
+                a = primary_artist(it.get("artist", ""))
+                if sig in sigs or per_artist.get(a, 0) >= 3:
+                    continue
+                sigs.add(sig)
+                taken.add(vid)
+                per_artist[a] = per_artist.get(a, 0) + 1
+                out.append(it)
+                if len(out) >= limit:
+                    break
+            return out
+        first = clean(mix_box.get("items") or [], per_shelf + 4)
+        if first:
+            shelves.append(("Recommended for today", subtitle0, first))
+        for (title, sub, _), items in zip(specs, lists):
+            got = clean(items, per_shelf)
+            if len(got) >= 4:
+                shelves.append((title, sub, got))
+        if not shelves and errors:
+            raise errors[0]
+        with self.lock:
+            for _, _, its in shelves:
+                self.shown.extend(i["id"] for i in its[:6])
+            del self.shown[:-SHOWN_MAX]
+            self._dirty = True
+        return shelves, mix_box.get("label") or "Made for you"

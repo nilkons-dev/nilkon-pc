@@ -130,9 +130,9 @@ class ConfirmDialog(_SmallDialog):
         self.add_buttons(ok_text, "check" if icon != "trash" else "trash", cancel_text)
 
 
-def ask_text(parent, title, message, text="", placeholder="", ok_text="Save", icon="edit"):
+def ask_text(parent, title, message, text="", placeholder="", ok_text="Save", icon="edit", max_len=80):
     """-> (text, ok)"""
-    dlg = PromptDialog(parent, title, message, text, placeholder, ok_text, icon)
+    dlg = PromptDialog(parent, title, message, text, placeholder, ok_text, icon, max_len)
     ok = dlg.exec() == QDialog.DialogCode.Accepted
     return dlg.field.text(), ok
 

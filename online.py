@@ -910,10 +910,98 @@ def cleanup_partial(folder, item):
         pass
 
 
+# -- fast download ------------------------------------------------------------------------------------------
+_dl_locks = {}
+_dl_locks_guard = threading.Lock()
+
+
+def fast_download(item, dest_dir, fmt, progress, cancelled):
+    """Download in parallel pieces straight from the stream address (several times faster than the extractor's
+    single connection), tag it, and move it into the library folder."""
+    import fastfetch
+    key = item["key"]
+    with _dl_locks_guard:
+        lock = _dl_locks.setdefault(key, threading.Lock())
+    with lock:                                          # the same song never downloads twice at once
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        tmp = Path.home() / ".nilkon_music" / "dl_tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        url, _dur = resolve(item)
+        mime = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("mime", ["audio/mp4"])[0]
+        ext = ".m4a" if "mp4" in mime else ".webm" if "webm" in mime else ".m4a"
+        part = tmp / f"{safe_name(item['id'], 30)}-{int(time.time() * 1000)}{ext}.part"
+        out = None
+        try:
+            def refresh():
+                forget(key, bad=True)
+                return resolve(item)[0]
+            try:
+                fastfetch.fetch_to_file(url, part, cancelled, lambda f: progress(f * 0.9), refresh=refresh)
+            except fastfetch.FetchError as exc:
+                if cancelled():
+                    raise Cancelled()
+                raise OnlineError(str(exc))
+            if cancelled():
+                raise Cancelled()
+            work = part.with_suffix("")                  # ....m4a / ....webm
+            os.replace(part, work)
+            part = work
+            ffmpeg = find_ffmpeg()
+            if ext == ".webm" and not ffmpeg:
+                raise OnlineError("webm needs the converter")
+            if (fmt == "mp3" or ext == ".webm") and ffmpeg:
+                import subprocess
+                target = part.with_suffix(".mp3" if fmt == "mp3" else ".m4a")
+                if target == part:
+                    target = part.with_name(part.stem + "-c" + part.suffix)
+                cmd = [ffmpeg, "-y", "-loglevel", "error", "-i", str(part), "-vn"]
+                cmd += ["-codec:a", "libmp3lame", "-b:a", "192k"] if fmt == "mp3" else ["-codec:a", "aac", "-b:a", "160k"]
+                cmd.append(str(target))
+                flags = 0x08000000 if os.name == "nt" else 0
+                r = subprocess.run(cmd, capture_output=True, creationflags=flags, timeout=300)
+                if r.returncode != 0 or not target.exists():
+                    raise OnlineError("conversion failed")
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
+                part = target
+            progress(0.94)
+            cover = None
+            try:
+                cover = fetch_bytes(item["thumb_url"]) if item.get("thumb_url") else None
+            except Exception:
+                pass
+            tag_file(str(part), item["title"], item["artist"], cover)
+            if cancelled():
+                raise Cancelled()
+            final = dest / (safe_name(item["title"]) + f" [{item['id']}]" + part.suffix)
+            out = fastfetch.move_with_retry(part, final)
+            progress(1.0)
+            return out
+        finally:
+            for f in (part,):
+                try:
+                    if out is None and f.exists():
+                        f.unlink()
+                except OSError:
+                    pass
+
+
 # -- registry -----------------------------------------------------------------------------------------------
 def download(item, dest_dir, fmt, progress, cancelled, plain=False):
     """plain=True: just fetch the audio (used for the temporary copy that feeds the visualiser)."""
     try:
+        if not plain:
+            try:
+                return fast_download(item, dest_dir, fmt, progress, cancelled)
+            except Cancelled:
+                raise
+            except Exception:
+                if cancelled():
+                    raise Cancelled()
+                progress(0.0)                          # the fast way failed: the full engine takes over
         return yt_download(item, dest_dir, fmt, progress, cancelled, plain)
     except Cancelled:
         raise

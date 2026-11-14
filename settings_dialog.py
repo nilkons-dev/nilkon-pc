@@ -475,6 +475,7 @@ class SettingsDialog(GlassDialog):
         lay.addWidget(SettingRow("Image blur", "Soften the picture for a frosted look.", self.blur))
         self._section(lay, "INTERFACE")
         self._toggle_row(lay, "title_song", "Song name in the window title", "Shows what is playing in the taskbar and title bar.")
+        self._toggle_row(lay, "close_to_tray", "Close button hides NILKON in the tray", "Music keeps playing. Quit from the tray icon (or turn this off to close the app completely).")
         self._toggle_row(lay, "toasts", "Pop-up messages", "Small confirmations such as “Added to favourites”. Errors always show.")
         lay.addStretch(1)
         return w
